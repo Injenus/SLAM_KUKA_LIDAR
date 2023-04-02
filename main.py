@@ -17,7 +17,7 @@ data = [ [x,y,w,[lidar_data_list]
                         ]
 that is data[i]=[x_i, y_i, w_i,[lidar_data_list_i]
 """
-cell_size = 0.1
+cell_size = 0.035
 map_size = (11, 9)
 map_cell_size = tuple(map(lambda x: int(x / cell_size), map_size))
 karta = np.zeros((1, map_cell_size[0], map_cell_size[1]))
@@ -79,6 +79,6 @@ def update(frame):
     return plt
 
 
-ani = animation.FuncAnimation(plt.gcf(), update, frames=data.shape[0],
+ani = animation.FuncAnimation(plt.gcf(), update, frames=100,
                               interval=1, repeat=False, blit=False)
 plt.show()
