@@ -8,7 +8,7 @@ matplotlib.rcParams['figure.subplot.left'] = 0
 matplotlib.rcParams['figure.subplot.bottom'] = 0
 matplotlib.rcParams['figure.subplot.right'] = 1
 matplotlib.rcParams['figure.subplot.top'] = 1
-
+NUM_FRAMES = 500  # NUM OF DATA (1600 max)
 file_name = 'all_data_like_pd.npy'
 data = np.load(file_name, allow_pickle=True)
 """
@@ -18,7 +18,7 @@ data = [ [x,y,w,[lidar_data_list]
 that is data[i]=[x_i, y_i, w_i,[lidar_data_list_i]
 """
 cell_size = 0.1
-map_size = (11, 9)
+map_size = (11, 11)
 map_cell_size = tuple(map(lambda x: int(x / cell_size), map_size))
 karta = np.zeros((1, map_cell_size[0], map_cell_size[1]))
 
@@ -27,7 +27,7 @@ log_odds_ratio = np.log(1)  # log odds ratio for unknown cells
 fov = 180
 max_range = 4
 min_range = 0.1
-# оффсет нужно вычитать из одометрии
+# Offset for origin
 offset = (-0.3, 2.7)
 for i in range(data.shape[0]):
     data[i][0] -= offset[0]
@@ -45,6 +45,7 @@ def get_cell_xy(x, y):
 
 
 odometry_data = data[0:1600, 0:3]
+### for test only (not used, all angles are 0)
 predict_move = np.ndarray(shape=(0, 3), dtype=float)
 predict_move = np.append(predict_move, [
     [odometry_data[0][0], odometry_data[0][1], odometry_data[0][2]]], axis=0)
@@ -58,8 +59,109 @@ for i in range(1, odometry_data.shape[0]):
                              axis=0)
 
 
+def compute_similarity_metric(map_delta):
+    # Compute the SSD metric between the two occupancy grid maps
+    ssd = np.sum(np.square(map_delta))
+    return ssd
+
+
+def compute_pose_correction(pose_delta, map_delta):
+    global map_cell_size
+    resolution = map_cell_size[0]
+    # Reshape the map delta to a 2D point cloud
+    thr = 0.1
+    point_cloud = np.argwhere(map_delta > thr)
+    cntr = 0
+    while len(point_cloud) == 0:
+        if cntr > 10:
+            thr = 0.1
+            point_cloud = np.argwhere(abs(map_delta) > thr)
+        else:
+            point_cloud = np.argwhere(map_delta > thr)
+        thr = thr / 2
+        cntr + 1
+    point_cloud = np.multiply(point_cloud, resolution)
+
+    # Apply the pose delta to the point cloud
+    transformed_point_cloud = np.add(point_cloud,
+                                     np.array([pose_delta[0], pose_delta[1]]))
+
+    # Initialize the pose correction to zero
+    pose_correction = np.zeros(3)
+
+    # Run the ICP algorithm
+    for i in range(10):
+        # Compute the closest points between the two point clouds
+        closest_points = []
+        for j in range(len(point_cloud)):
+            transformed_point = np.add(point_cloud[j], np.array(
+                [pose_correction[0], pose_correction[1]]))
+            distances = np.linalg.norm(
+                transformed_point_cloud - transformed_point, axis=1)
+            closest_index = np.argmin(distances)
+            closest_point = transformed_point_cloud[closest_index]
+            closest_points.append(closest_point)
+        closest_points = np.array(closest_points)
+
+        # Compute the pose correction using the least squares method
+        A = np.hstack((closest_points, np.ones((len(closest_points), 1))))
+        b = np.hstack((point_cloud, np.ones((len(point_cloud), 1))))
+        x, residuals, _, _ = np.linalg.lstsq(A, b, rcond=None)
+        pose_correction = np.array(
+            [x[0, 2], x[1, 2], math.atan2(x[0, 1], x[0, 0])])
+
+    return pose_correction
+
+
+def optimize_occupancy_grid_map(occupancy_grid, pose_correction,
+                                prev_occupancy_grid, log_odds_ratio_occ=0.5,
+                                log_odds_ratio_free=0.5):
+    global map_cell_size
+
+    map_size = resolution = map_cell_size[0]
+    # Initialize the optimized occupancy grid map
+    optimized_occupancy_grid = np.zeros((map_size, map_size))
+
+    # Loop over each cell in the map
+    for i in range(map_size):
+        for j in range(map_size):
+            # Convert the cell indices to world coordinates
+            x = i * resolution
+            y = j * resolution
+
+            # Compute the corrected world coordinates
+            (dx, dy, dtheta) = pose_correction
+            x_corr = x + dx
+            y_corr = y + dy
+
+            # Convert the corrected world coordinates to cell indices in the previous occupancy grid map
+            i_prev = int(round(x_corr / resolution))
+            j_prev = int(round(y_corr / resolution))
+
+            # Check if the previous occupancy grid map contains the corrected cell coordinates
+            if i_prev >= 0 and i_prev < map_size and j_prev >= 0 and j_prev < map_size:
+                # Update the occupancy probability of the current cell in the optimized map using the log odds ratio approach
+                log_odds_ratio = log_odds_ratio_occ if prev_occupancy_grid[
+                                                           i_prev, j_prev] == 1 else log_odds_ratio_free
+                optimized_occupancy_grid[i, j] = occupancy_grid[
+                                                     i, j] + log_odds_ratio - np.log(
+                    1 + np.exp(log_odds_ratio - occupancy_grid[i, j]))
+            else:
+                # If the corrected cell coordinates are outside the previous occupancy grid map, use the current occupancy grid map
+                optimized_occupancy_grid[i, j] = occupancy_grid[i, j]
+
+    return optimized_occupancy_grid
+
+
+robot_pose = np.array(
+    [odometry_data[0][0], odometry_data[0][1], odometry_data[0][2]])
+keyframes = []
+
+
 def update(frame):
-    global karta, isInit
+    per_frames = 100
+    global karta, isInit, robot_pose, keyframes
+    threshold = 0.1
     print(frame)
     if isInit:
         isInit = False
@@ -68,24 +170,14 @@ def update(frame):
                               predict_move[frame][2]
         lidar_data = data[frame][3]
         cell_robot_xy = [int(odo_x / cell_size), int(odo_y / cell_size)]
-        #karta[frame][cell_robot_xy[0], cell_robot_xy[1]] = 1
+        # karta[frame][cell_robot_xy[0], cell_robot_xy[1]] = 1
+        robot_pose = np.array([odo_x, odo_y, odo_w])
 
         rads_lidar = np.linspace(-fov / 360 * np.pi, fov / 360 * np.pi,
                                  len(lidar_data))
         x_l = odo_x + math.cos(odo_w) * 0.3
         y_l = odo_y + math.sin(odo_w) * 0.3
         cell_lidar_xy = [int(x_l / cell_size), int(y_l / cell_size)]
-
-        # for i in range(len(lidar_data)):
-        #     x = lidar_data[i] * math.cos(odo_w - rads_lidar[i]) + x_l
-        #     y = lidar_data[i] * math.sin(odo_w - rads_lidar[i]) + y_l
-        #     cell_obs_x = int(x / cell_size)
-        #     cell_obs_y = int(y / cell_size)
-        #     if min_range <= distance_btw_points(x_l, y_l, x, y) <= max_range:
-        #         try:
-        #             karta[frame][cell_obs_x, cell_obs_y] = 1
-        #         except IndexError:
-        #             pass
 
         for i in range(len(lidar_data)):
             x = lidar_data[i] * math.cos(odo_w - rads_lidar[i]) + x_l
@@ -123,26 +215,31 @@ def update(frame):
                 except IndexError:
                     pass
 
-                # if cell_obs_x >= 0 and cell_obs_x < map_cell_size[
-                #     0] and cell_obs_y >= 0 and cell_obs_y < map_cell_size[1]:
-                #     if karta[frame][cell_obs_x, cell_obs_y] == 0.5:
-                #         karta[frame][cell_obs_x, cell_obs_y] = np.exp(
-                #             log_odds_ratio) / (1 + np.exp(log_odds_ratio))
-                #     else:
-                #         karta[frame][cell_obs_x, cell_obs_y] = 1.0 - np.exp(
-                #             log_odds_ratio) / (1 + np.exp(log_odds_ratio))
+        if frame == per_frames:
+            current_keyframe = (robot_pose.copy(), karta[frame].copy())
+            keyframes.append(current_keyframe)
 
-        # x = np.multiply(lidar_data, np.cos(odo_w - rads_lidar)) + x_l
-        # y = np.multiply(lidar_data, np.sin(odo_w - rads_lidar)) + y_l
-        # cell_obstacle_x = np.rint(np.divide(x, cell_size)).astype(int)
-        # cell_obstacle_y = np.rint(np.divide(y, cell_size)).astype(int)
-        # for o in range(cell_obstacle_x.shape[0]):
-        #     if min_range <= distance_btw_points(x_l, y_l, x[o],
-        #                                         y[o]) <= max_range:
-        #         try:
-        #             karta[frame][cell_obstacle_x[o], cell_obstacle_y[o]] = 1
-        #         except IndexError:
-        #             pass
+        # Check for loop closures
+        if frame % per_frames == 0 and frame > per_frames:  # Check every 100 steps
+            current_keyframe = (robot_pose.copy(), karta[frame].copy())
+
+            for j in range(len(keyframes)):
+                prev_keyframe = keyframes[j]
+                pose_delta = current_keyframe[0] - prev_keyframe[0]
+                map_delta = current_keyframe[1] - prev_keyframe[1]
+                # Compute the similarity metric between the current map and previous maps
+                similarity_metric = compute_similarity_metric(map_delta)
+                if similarity_metric > threshold:
+                    # Correct the robot pose and occupancy grid map using pose graph optimization
+                    pose_correction = compute_pose_correction(pose_delta,
+                                                              map_delta)
+                    robot_pose += pose_correction
+                    karta[frame] = optimize_occupancy_grid_map(
+                        karta[frame], pose_correction, prev_keyframe[1])
+                    break
+
+            keyframes.append(current_keyframe)
+
         karta = np.concatenate(
             (
                 karta,
@@ -151,11 +248,11 @@ def update(frame):
     plt.clf()
     plt.xticks([])
     plt.yticks([])
-    #plt.imshow(karta[frame], cmap='PuOr', vmin=-0.2, vmax=0.5)
+    # plt.imshow(karta[frame], cmap='PuOr', vmin=-0.2, vmax=0.5)
     plt.imshow(karta[frame], cmap='PuOr')
     return plt
 
 
-ani = animation.FuncAnimation(plt.gcf(), update, frames=100,
+ani = animation.FuncAnimation(plt.gcf(), update, frames=NUM_FRAMES,
                               interval=1, repeat=False, blit=False)
 plt.show()
