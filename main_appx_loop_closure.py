@@ -159,29 +159,31 @@ keyframes = []
 
 
 def update(frame):
-    per_frames = 100
+    per_frames = 50
     global karta, isInit, robot_pose, keyframes
-    threshold = 0.1
+    threshold = 1
     print(frame)
     if isInit:
         isInit = False
     else:
-        odo_x, odo_y, odo_w = predict_move[frame][0], predict_move[frame][1], \
-                              predict_move[frame][2]
+        # odo_x, odo_y, odo_w = predict_move[frame][0], predict_move[frame][1], \
+        #                       predict_move[frame][2]
+        dx, dy, dtheta = predict_move[frame][0]-robot_pose[0], predict_move[frame][1]-robot_pose[1], \
+                              predict_move[frame][2]-robot_pose[2]
         lidar_data = data[frame][3]
-        cell_robot_xy = [int(odo_x / cell_size), int(odo_y / cell_size)]
+        #cell_robot_xy = [int(odo_x / cell_size), int(odo_y / cell_size)]
         # karta[frame][cell_robot_xy[0], cell_robot_xy[1]] = 1
-        robot_pose = np.array([odo_x, odo_y, odo_w])
+        robot_pose += np.array([dx, dy, dtheta])
 
         rads_lidar = np.linspace(-fov / 360 * np.pi, fov / 360 * np.pi,
                                  len(lidar_data))
-        x_l = odo_x + math.cos(odo_w) * 0.3
-        y_l = odo_y + math.sin(odo_w) * 0.3
+        x_l = robot_pose[0] + math.cos(robot_pose[2]) * 0.3
+        y_l = robot_pose[1] + math.sin(robot_pose[2]) * 0.3
         cell_lidar_xy = [int(x_l / cell_size), int(y_l / cell_size)]
 
         for i in range(len(lidar_data)):
-            x = lidar_data[i] * math.cos(odo_w - rads_lidar[i]) + x_l
-            y = lidar_data[i] * math.sin(odo_w - rads_lidar[i]) + y_l
+            x = lidar_data[i] * math.cos(robot_pose[2] - rads_lidar[i]) + x_l
+            y = lidar_data[i] * math.sin(robot_pose[2] - rads_lidar[i]) + y_l
             cell_obs_x = int(x / cell_size)
             cell_obs_y = int(y / cell_size)
             if min_range <= distance_btw_points(x_l, y_l, x, y) <= max_range:
